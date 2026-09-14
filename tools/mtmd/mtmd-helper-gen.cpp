@@ -104,6 +104,14 @@ protected:
 
 // Qwen3-TTS: backbone samples codec_0, code_predictor gives the other 15 codebooks,
 // then code2wav decodes them to PCM
+
+// babble guard tuning (ported from tools/tts/tts.cpp): healthy speech holds the
+// EOS-token probability around 1e-9 and spikes to ~1.0 at the last frame, while
+// degenerate runs collapse below 1e-11 and never recover
+static constexpr float kQwen3TtsBabblePEos      = 1e-11f;
+static constexpr int   kQwen3TtsBabbleMinFrames = 72; // 6s at 12Hz
+static constexpr int   kQwen3TtsBabblePatience  = 24; // 2s of sustained collapse
+
 class qwen3tts_gen_audio_pipeline : public mtmd_gen_audio_pipeline {
 public:
     using mtmd_gen_audio_pipeline::mtmd_gen_audio_pipeline;
@@ -121,6 +129,9 @@ public:
         prompt_batch.reset();
         n_prompt = 0;
         prompt_pos = 0;
+        // babble guard state
+        n_gen_frames = 0;
+        n_babble = 0;
     }
 
     int32_t set_input(const mtmd_helper_gen_audio_inp * inp) override {
@@ -297,6 +308,45 @@ public:
         h_state_buf.assign(he, he + n_embd);
         *h_state_out = h_state_buf.data();
 
+        // babble guard (ported from tools/tts/tts.cpp): the backbone logits
+        // decoded above feed the next frame's sampling; healthy speech holds
+        // p_eos around 1e-9 and spikes to ~1.0 at the last frame, while
+        // degenerate runs collapse below 1e-11 and never recover
+        n_gen_frames++;
+        if (n_gen_frames >= kQwen3TtsBabbleMinFrames) {
+            const float * logits = llama_get_logits_ith(lctx, -1);
+            const int n_vocab = llama_vocab_n_tokens(vocab);
+            // NaN/Inf logits 无法计算概率（乱语/显存异常时可能出现），
+            // 视为生成退化直接累计崩溃，避免 NaN < 阈值恒为假导致守卫失效
+            bool finite = std::isfinite(logits[0]);
+            float mx = logits[0];
+            for (int t = 1; t < n_vocab && finite; t++) {
+                if (!std::isfinite(logits[t])) {
+                    finite = false;
+                    break;
+                }
+                mx = std::max(mx, logits[t]);
+            }
+            double sum = 0.0;
+            for (int t = 0; t < n_vocab && finite; t++) {
+                sum += std::exp((double) logits[t] - mx);
+            }
+            const bool collapsed = !finite || !(sum > 0.0);
+            const double p_eos = collapsed ? 0.0
+                : std::exp((double) logits[codec_eos] - mx) / sum;
+            LOG_DBG("p_eos = %.3e, collapsed=%d\n", p_eos, (int) collapsed);
+            n_babble = (collapsed || p_eos < (double) kQwen3TtsBabblePEos)
+                       ? n_babble + 1 : 0;
+            if (n_babble >= kQwen3TtsBabblePatience) {
+                LOG_WRN("mtmd_helper_gen_audio: EOS probability collapsed, "
+                        "stopping early at frame %d\n", n_gen_frames);
+                *out_stop    = true;
+                // 契约：out_stop=true 时 h_state_out 必须为空（无新帧）
+                *h_state_out = nullptr;
+                return 0;
+            }
+        }
+
         return 0;
     }
 
@@ -440,6 +490,9 @@ private:
     llama_seq_id seq_id = 0;
     bool mrope = false;
     int pos = 0;
+    // babble guard state, cleared by reset()
+    int n_gen_frames = 0;
+    int n_babble = 0;
     // prompt decode state, consumed batch-by-batch by step_prompt()
     std::vector<float> prompt_embd_buf;
     std::unique_ptr<decode_embd_batch> prompt_batch;

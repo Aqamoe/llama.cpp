@@ -278,11 +278,11 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         // add GPUs
         model->devices.insert(model->devices.end(), gpus.begin(), gpus.end());
 
-        // add integrated GPUs only if no discrete GPUs were found
-        // (RPC servers do not count, otherwise the local iGPU would be dropped on iGPU+RPC setups)
-        if (gpus.empty()) {
-            model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
-        }
+        // VRTranslator patch: always append integrated GPUs after discrete
+        // GPUs (upstream only keeps iGPUs when no dGPU exists). This allows
+        // selecting the iGPU as main_gpu for inference on iGPU-only memory.
+        // iGPUs come after dGPUs so dGPU indices keep their default order.
+        model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
     }
 
     // if using single GPU mode, remove all except the main GPU
